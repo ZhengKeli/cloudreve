@@ -45,6 +45,7 @@ type (
 		SrcFileUri         string                 `json:"src_file_uri,omitempty"`
 		SrcUri             string                 `json:"src_uri,omitempty"`
 		Dst                string                 `json:"dst,omitempty"`
+		DstFiles           []string               `json:"dst_files,omitempty"`
 		Handle             *downloader.TaskHandle `json:"handle,omitempty"`
 		Status             *downloader.TaskStatus `json:"status,omitempty"`
 		NodeState          `json:",inline"`
@@ -82,11 +83,12 @@ func init() {
 }
 
 // NewRemoteDownloadTask creates a new RemoteDownloadTask
-func NewRemoteDownloadTask(ctx context.Context, src string, srcFile, dst string) (queue.Task, error) {
+func NewRemoteDownloadTask(ctx context.Context, src string, srcFile, dst string, dstFiles []string) (queue.Task, error) {
 	state := &RemoteDownloadTaskState{
 		SrcUri:     src,
 		SrcFileUri: srcFile,
 		Dst:        dst,
+		DstFiles:   dstFiles,
 		NodeState:  NodeState{},
 	}
 	stateBytes, err := json.Marshal(state)
@@ -215,7 +217,19 @@ func (m *RemoteDownloadTask) createDownloadTask(ctx context.Context, dep depende
 	}
 
 	// Create download task
-	handle, err := m.d.CreateTask(ctx, torrentUrl, user.Edges.Group.Settings.RemoteDownloadOptions)
+	downloadOptions := user.Edges.Group.Settings.RemoteDownloadOptions
+	// If a custom name is provided for this URL download (non-torrent),
+	// pass the "out" option to the downloader to set the output filename.
+	if m.state.SrcFileUri == "" && m.state.SrcUri != "" && len(m.state.DstFiles) > 0 && m.state.DstFiles[0] != "" {
+		optsCopy := make(map[string]interface{}, len(downloadOptions))
+		for k, v := range downloadOptions {
+			optsCopy[k] = v
+		}
+		optsCopy["out"] = m.state.DstFiles[0]
+		downloadOptions = optsCopy
+	}
+
+	handle, err := m.d.CreateTask(ctx, torrentUrl, downloadOptions)
 	if err != nil {
 		return task.StatusError, fmt.Errorf("failed to create download task: %w", err)
 	}
@@ -353,7 +367,7 @@ func (m *RemoteDownloadTask) slaveTransfer(ctx context.Context, dep dependency.D
 				continue
 			}
 
-			dst := dstUri.JoinRaw(sanitizeFileName(f.Name))
+			dst := dstUri.JoinRaw(m.resolveFileName(f.Index, f.Name))
 			src := path.Join(m.state.Status.SavePath, f.Name)
 			payload.Files = append(payload.Files, SlaveUploadEntity{
 				Src:   src,
@@ -466,7 +480,7 @@ func (m *RemoteDownloadTask) masterTransfer(ctx context.Context, dep dependency.
 	ae := serializer.NewAggregateError()
 
 	transferFunc := func(workerId int, file downloader.TaskFile) {
-		sanitizedName := sanitizeFileName(file.Name)
+		sanitizedName := m.resolveFileName(file.Index, file.Name)
 		dst := dstUri.JoinRaw(sanitizedName)
 		src := filepath.FromSlash(path.Join(m.state.Status.SavePath, file.Name))
 		m.l.Info("Uploading file %s to %s...", src, sanitizedName, dst)
@@ -579,9 +593,9 @@ func (m *RemoteDownloadTask) validateFiles(ctx context.Context, dep dependency.D
 
 	validateArgs := lo.Map(selectedFiles, func(f downloader.TaskFile, _ int) fs.PreValidateFile {
 		return fs.PreValidateFile{
-			Name:     sanitizeFileName(f.Name),
+			Name:     m.resolveFileName(f.Index, f.Name),
 			Size:     f.Size,
-			OmitName: f.Name == "",
+			OmitName: f.Name == "" && !m.hasCustomName(f.Index),
 		}
 	})
 
@@ -676,6 +690,39 @@ func (m *RemoteDownloadTask) Progress(ctx context.Context) queue.Progresses {
 	}
 
 	return merged
+}
+
+// resolveFileName returns the destination file name for a downloaded file.
+// If a custom name is provided in DstFiles for the given file index, it is
+// used (after sanitization). Otherwise, the original file name is used.
+func (m *RemoteDownloadTask) resolveFileName(fileIndex int, originalName string) string {
+	if m.state.DstFiles != nil {
+		var customName string
+		if m.state.SrcUri != "" {
+			// URL download: single custom name at index 0
+			if len(m.state.DstFiles) > 0 && m.state.DstFiles[0] != "" {
+				customName = m.state.DstFiles[0]
+			}
+		} else if fileIndex < len(m.state.DstFiles) && m.state.DstFiles[fileIndex] != "" {
+			// Torrent download: map by file index
+			customName = m.state.DstFiles[fileIndex]
+		}
+		if customName != "" {
+			return sanitizeFileName(customName)
+		}
+	}
+	return sanitizeFileName(originalName)
+}
+
+// hasCustomName returns true if a custom name is provided for the given file index.
+func (m *RemoteDownloadTask) hasCustomName(fileIndex int) bool {
+	if m.state.DstFiles == nil {
+		return false
+	}
+	if m.state.SrcUri != "" {
+		return len(m.state.DstFiles) > 0 && m.state.DstFiles[0] != ""
+	}
+	return fileIndex < len(m.state.DstFiles) && m.state.DstFiles[fileIndex] != ""
 }
 
 func sanitizeFileName(name string) string {

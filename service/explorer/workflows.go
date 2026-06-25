@@ -73,7 +73,8 @@ type (
 	DownloadWorkflowService struct {
 		Src     []string `json:"src"`
 		SrcFile string   `json:"src_file"`
-		Dst     string   `json:"dst" binding:"required"`
+		Dst     string   `json:"dst"`
+		DstFiles []string `json:"dst_files"`
 	}
 	CreateDownloadParamCtx struct{}
 )
@@ -89,7 +90,7 @@ func (service *DownloadWorkflowService) CreateDownloadTask(c *gin.Context) ([]*T
 		return nil, serializer.NewError(serializer.CodeGroupNotAllowed, "Group not allowed to download files", nil)
 	}
 
-	// Src must be set
+	// At least one of src and src_file must be set
 	if service.SrcFile == "" && len(service.Src) == 0 {
 		return nil, serializer.NewError(serializer.CodeParamErr, "No source files", nil)
 	}
@@ -99,13 +100,35 @@ func (service *DownloadWorkflowService) CreateDownloadTask(c *gin.Context) ([]*T
 		return nil, serializer.NewError(serializer.CodeParamErr, "Invalid source files", nil)
 	}
 
-	dst, err := fs.NewUriFromString(service.Dst)
+	// Dst or DstFiles must be provided
+	if service.Dst == "" && len(service.DstFiles) == 0 {
+		return nil, serializer.NewError(serializer.CodeParamErr, "No destination specified", nil)
+	}
+
+	// If DstFiles is provided for URL downloads, it must match the number of src URLs
+	if service.SrcFile == "" && len(service.DstFiles) > 0 && len(service.DstFiles) != len(service.Src) {
+		return nil, serializer.NewError(serializer.CodeParamErr, "Number of dst_files must match number of src URLs", nil)
+	}
+
+	var dst string
+	if service.Dst != "" {
+		dst = service.Dst
+	} else if len(service.DstFiles) > 0 {
+		// Derive the destination folder from the first dst_files entry's parent
+		firstDst, err := fs.NewUriFromString(service.DstFiles[0])
+		if err != nil {
+			return nil, serializer.NewError(serializer.CodeParamErr, "Invalid dst_files entry", err)
+		}
+		dst = firstDst.DirUri().String()
+	}
+
+	dstUri, err := fs.NewUriFromString(dst)
 	if err != nil {
 		return nil, serializer.NewError(serializer.CodeParamErr, "Invalid destination", err)
 	}
 
 	// Validate dst
-	_, err = m.Get(c, dst, dbfs.WithRequiredCapabilities(dbfs.NavigatorCapabilityCreateFile))
+	_, err = m.Get(c, dstUri, dbfs.WithRequiredCapabilities(dbfs.NavigatorCapabilityCreateFile))
 	if err != nil {
 		return nil, serializer.NewError(serializer.CodeParamErr, "Invalid destination", err)
 	}
@@ -132,12 +155,18 @@ func (service *DownloadWorkflowService) CreateDownloadTask(c *gin.Context) ([]*T
 	// batch creating tasks
 	ae := serializer.NewAggregateError()
 	tasks := make([]queue.Task, 0, len(service.Src))
-	for _, src := range service.Src {
+	for i, src := range service.Src {
 		if src == "" {
 			continue
 		}
 
-		t, err := workflows.NewRemoteDownloadTask(c, src, service.SrcFile, service.Dst)
+		// Get the corresponding dst_files entry for this URL
+		var dstFile string
+		if i < len(service.DstFiles) {
+			dstFile = service.DstFiles[i]
+		}
+
+		t, err := workflows.NewRemoteDownloadTask(c, src, service.SrcFile, dst, []string{dstFile})
 		if err != nil {
 			ae.Add(src, err)
 			continue
@@ -151,7 +180,7 @@ func (service *DownloadWorkflowService) CreateDownloadTask(c *gin.Context) ([]*T
 	}
 
 	if service.SrcFile != "" {
-		t, err := workflows.NewRemoteDownloadTask(c, "", service.SrcFile, service.Dst)
+		t, err := workflows.NewRemoteDownloadTask(c, "", service.SrcFile, dst, service.DstFiles)
 		if err != nil {
 			ae.Add(service.SrcFile, err)
 		}
