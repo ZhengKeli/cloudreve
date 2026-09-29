@@ -2,6 +2,8 @@ package explorer
 
 import (
 	"encoding/gob"
+	"encoding/json"
+	"fmt"
 	"github.com/cloudreve/Cloudreve/v4/pkg/hashid"
 	"time"
 
@@ -70,13 +72,33 @@ func init() {
 }
 
 type (
+	DownloadDst struct {
+		Folder string
+		Files  []string
+	}
 	DownloadWorkflowService struct {
-		Src     []string `json:"src"`
-		SrcFile string   `json:"src_file"`
-		Dst     string   `json:"dst" binding:"required"`
+		Src     []string    `json:"src"`
+		SrcFile string      `json:"src_file"`
+		Dst     DownloadDst `json:"dst"`
 	}
 	CreateDownloadParamCtx struct{}
 )
+
+func (d *DownloadDst) UnmarshalJSON(data []byte) error {
+	var folder string
+	if err := json.Unmarshal(data, &folder); err == nil {
+		d.Folder = folder
+		return nil
+	}
+
+	var files []string
+	if err := json.Unmarshal(data, &files); err == nil {
+		d.Files = files
+		return nil
+	}
+
+	return fmt.Errorf("dst must be a folder URI string or a list of destination file URIs")
+}
 
 func (service *DownloadWorkflowService) CreateDownloadTask(c *gin.Context) ([]*TaskResponse, error) {
 	dep := dependency.FromContext(c)
@@ -99,15 +121,59 @@ func (service *DownloadWorkflowService) CreateDownloadTask(c *gin.Context) ([]*T
 		return nil, serializer.NewError(serializer.CodeParamErr, "Invalid source files", nil)
 	}
 
-	dst, err := fs.NewUriFromString(service.Dst)
-	if err != nil {
-		return nil, serializer.NewError(serializer.CodeParamErr, "Invalid destination", err)
+	// Dst must be provided
+	if service.Dst.Folder == "" && len(service.Dst.Files) == 0 {
+		return nil, serializer.NewError(serializer.CodeParamErr, "No destination specified", nil)
 	}
 
-	// Validate dst
-	_, err = m.Get(c, dst, dbfs.WithRequiredCapabilities(dbfs.NavigatorCapabilityCreateFile))
-	if err != nil {
-		return nil, serializer.NewError(serializer.CodeParamErr, "Invalid destination", err)
+	// Torrent downloads only accept a folder destination
+	if service.SrcFile != "" && len(service.Dst.Files) > 0 {
+		return nil, serializer.NewError(serializer.CodeParamErr, "Dst must be a folder URI for torrent downloads", nil)
+	}
+
+	// If dst is a list, it must match the number of src URLs
+	if len(service.Dst.Files) > 0 && len(service.Dst.Files) != len(service.Src) {
+		return nil, serializer.NewError(serializer.CodeParamErr, "Number of dst entries must match number of src URLs", nil)
+	}
+
+	// Resolve per-source destination folder and custom file name
+	dstFolders := make([]string, len(service.Src))
+	dstNames := make([]string, len(service.Src))
+	if len(service.Dst.Files) > 0 {
+		for i, entry := range service.Dst.Files {
+			dstUri, err := fs.NewUriFromString(entry)
+			if err != nil {
+				return nil, serializer.NewError(serializer.CodeParamErr, "Invalid destination", err)
+			}
+
+			name := dstUri.Name()
+			if name == fs.Separator {
+				return nil, serializer.NewError(serializer.CodeParamErr, "Invalid destination", nil)
+			}
+
+			dstFolders[i] = dstUri.DirUri().String()
+			dstNames[i] = name
+		}
+	} else {
+		for i := range service.Src {
+			dstFolders[i] = service.Dst.Folder
+		}
+	}
+
+	// Validate dst folder(s)
+	for _, folder := range lo.Uniq(append(dstFolders, service.Dst.Folder)) {
+		if folder == "" {
+			continue
+		}
+
+		folderUri, err := fs.NewUriFromString(folder)
+		if err != nil {
+			return nil, serializer.NewError(serializer.CodeParamErr, "Invalid destination", err)
+		}
+
+		if _, err = m.Get(c, folderUri, dbfs.WithRequiredCapabilities(dbfs.NavigatorCapabilityCreateFile)); err != nil {
+			return nil, serializer.NewError(serializer.CodeParamErr, "Invalid destination", err)
+		}
 	}
 
 	// 检查批量任务数量
@@ -132,12 +198,17 @@ func (service *DownloadWorkflowService) CreateDownloadTask(c *gin.Context) ([]*T
 	// batch creating tasks
 	ae := serializer.NewAggregateError()
 	tasks := make([]queue.Task, 0, len(service.Src))
-	for _, src := range service.Src {
+	for i, src := range service.Src {
 		if src == "" {
 			continue
 		}
 
-		t, err := workflows.NewRemoteDownloadTask(c, src, service.SrcFile, service.Dst)
+		var dstFiles []string
+		if i < len(dstNames) && dstNames[i] != "" {
+			dstFiles = []string{dstNames[i]}
+		}
+
+		t, err := workflows.NewRemoteDownloadTask(c, src, service.SrcFile, dstFolders[i], dstFiles)
 		if err != nil {
 			ae.Add(src, err)
 			continue
@@ -151,7 +222,7 @@ func (service *DownloadWorkflowService) CreateDownloadTask(c *gin.Context) ([]*T
 	}
 
 	if service.SrcFile != "" {
-		t, err := workflows.NewRemoteDownloadTask(c, "", service.SrcFile, service.Dst)
+		t, err := workflows.NewRemoteDownloadTask(c, "", service.SrcFile, service.Dst.Folder, nil)
 		if err != nil {
 			ae.Add(service.SrcFile, err)
 		}
